@@ -128,14 +128,14 @@ def get_init_inputs():
 # Test 2: Kernel Optimization via OptimizationManager
 # =========================================================================
 
-# A simple initial kernel to optimize (correct but unoptimized sigmoid)
+# A simple initial kernel to optimize (correct but unoptimized element-wise multiply)
 _INITIAL_KERNEL = '''
 import torch
 import triton
 import triton.language as tl
 
 @triton.jit
-def _sigmoid_kernel(
+def _double_kernel(
     x_ptr, out_ptr,
     n_elements,
     BLOCK_SIZE: tl.constexpr,
@@ -144,14 +144,13 @@ def _sigmoid_kernel(
     offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = offsets < n_elements
     x = tl.load(x_ptr + offsets, mask=mask)
-    out = 1.0 / (1.0 + tl.exp(-x))
-    tl.store(out_ptr + offsets, out, mask=mask)
+    tl.store(out_ptr + offsets, x * 2.0, mask=mask)
 
 def kernel_function(x: torch.Tensor) -> torch.Tensor:
     out = torch.empty_like(x)
     n = x.numel()
     grid = lambda meta: (triton.cdiv(n, meta["BLOCK_SIZE"]),)
-    _sigmoid_kernel[grid](x, out, n, BLOCK_SIZE=1024)
+    _double_kernel[grid](x, out, n, BLOCK_SIZE=1024)
     return out
 '''
 
@@ -161,16 +160,13 @@ import torch.nn as nn
 
 class Model(nn.Module):
     def __init__(self):
-        super(Model, self).__init__()
+        super().__init__()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return torch.sigmoid(x)
-
-batch_size = 16
-dim = 16384
+        return x * 2.0
 
 def get_inputs():
-    return [torch.randn(batch_size, dim)]
+    return [torch.randn(1024, 1024)]
 
 def get_init_inputs():
     return []
@@ -181,29 +177,16 @@ import torch
 import sys
 sys.path.insert(0, ".")
 from kernel import kernel_function
-from problem import Model, get_inputs, get_init_inputs
 
 def test_kernel():
-    device = "cuda"
-    dtype = torch.bfloat16
-
-    model = Model(*get_init_inputs()).to(device).to(dtype)
-    inputs = [
-        x.to(device).to(dtype) if isinstance(x, torch.Tensor) and x.is_floating_point()
-        else x.to(device) if isinstance(x, torch.Tensor)
-        else x
-        for x in get_inputs()
-    ]
-
-    with torch.no_grad():
-        ref = model(*inputs)
-    out = kernel_function(*inputs)
-
-    if torch.allclose(ref, out, rtol=1e-2, atol=1e-2):
+    x = torch.randn(1024, 1024, device="cuda")
+    out = kernel_function(x)
+    expected = x * 2.0
+    if torch.allclose(out, expected, atol=1e-5):
         print("PASS")
         return True
     else:
-        diff = (ref - out).abs().max().item()
+        diff = (out - expected).abs().max().item()
         print(f"FAIL: max diff = {diff}")
         return False
 
@@ -233,9 +216,12 @@ def test_optimize():
     print(f"  Pod: {kubectl_config.pod_name}")
     print(f"  Namespace: {kubectl_config.namespace}")
 
-    with tempfile.TemporaryDirectory(prefix="kubectl_opt_") as tmpdir:
-        tmpdir = Path(tmpdir)
+    from datetime import datetime
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    tmpdir = Path.cwd() / "triton_kernel_logs" / f"kubectl_optimize_{timestamp}"
+    tmpdir.mkdir(parents=True, exist_ok=True)
 
+    if True:
         # Write problem + test files
         problem_file = tmpdir / "problem.py"
         problem_file.write_text(_PROBLEM_PY)
@@ -243,7 +229,7 @@ def test_optimize():
 
         log_dir = tmpdir / "logs"
 
-        print(f"  Problem: element-wise sigmoid (16 x 16384)")
+        print(f"  Problem: element-wise double (1024 x 1024)")
         print(f"  Strategy: beam_search (2 workers, 2 rounds)")
         print(f"  Log dir: {log_dir}")
         print()

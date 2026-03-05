@@ -189,6 +189,14 @@ class OptimizationWorker:
 
         # Get GPU specs (via registry-resolved provider or default NVIDIA lookup)
         specs_provider = self._platform.get("specs_provider")
+        if specs_provider is None and self.kubectl_config is not None:
+            from triton_kernel_agent.platform.kubectl import (
+                KubectlAcceleratorSpecsProvider,
+            )
+
+            specs_provider = KubectlAcceleratorSpecsProvider(
+                kubectl_config=self.kubectl_config, logger=self.logger
+            )
         if specs_provider is not None:
             self.gpu_specs = specs_provider.get_specs(self.gpu_name)
         else:
@@ -297,6 +305,10 @@ class OptimizationWorker:
         # Profiler
         if "profiler" in self._platform:
             self.profiler = self._platform["profiler"]
+        elif self.kubectl_config is not None:
+            from triton_kernel_agent.platform.kubectl import KubectlKernelProfiler
+
+            self.profiler = KubectlKernelProfiler()
         else:
             from triton_kernel_agent.opt_worker_component.profiling.kernel_profiler import (
                 KernelProfiler,
@@ -313,6 +325,16 @@ class OptimizationWorker:
         # Bottleneck analyzer
         if "bottleneck_analyzer" in self._platform:
             self.bottleneck_analyzer = self._platform["bottleneck_analyzer"]
+        elif self.kubectl_config is not None:
+            from triton_kernel_agent.platform.kubectl import KubectlBottleneckAnalyzer
+
+            self.bottleneck_analyzer = KubectlBottleneckAnalyzer(
+                logger=self.logger,
+                log_dir=self.log_dir,
+                openai_model=self.openai_model,
+                kubectl_config=self.kubectl_config,
+                gpu_specs=self.gpu_specs,
+            )
         else:
             from triton_kernel_agent.opt_worker_component.prescribing.bottleneck_analyzer import (
                 BottleneckAnalyzer,
@@ -356,6 +378,10 @@ class OptimizationWorker:
         # Roofline analyzer
         if "roofline_analyzer" in self._platform:
             self.roofline_analyzer = self._platform["roofline_analyzer"]
+        elif self.kubectl_config is not None:
+            from triton_kernel_agent.platform.kubectl import KubectlRooflineAnalyzer
+
+            self.roofline_analyzer = KubectlRooflineAnalyzer()
         else:
             from kernel_perf_agent.kernel_opt.roofline.ncu_roofline import (
                 RooflineAnalyzer,

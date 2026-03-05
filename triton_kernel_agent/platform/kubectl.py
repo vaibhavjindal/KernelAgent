@@ -448,8 +448,15 @@ class KubectlVerifier(KernelVerifier):
             if rc == 0:
                 self.logger.info("Initial kernel passed correctness verification (kubectl)")
             else:
+                # Filter kubectl "Defaulted container" warning from real errors
+                real_stderr = "\n".join(
+                    line for line in stderr.splitlines()
+                    if "Defaulted container" not in line
+                ).strip()
                 self.logger.error(
-                    f"Initial kernel failed verification (kubectl): {stderr[:200]}"
+                    f"Initial kernel failed verification (kubectl):\n"
+                    f"  stdout: {stdout[:500]}\n"
+                    f"  stderr: {real_stderr[:1000]}"
                 )
 
             return rc == 0
@@ -791,6 +798,10 @@ def _kubectl_worker_process(
 
         shutil.copy(problem_file, workdir / "problem.py")
 
+        # Remove kubectl_config from worker_kwargs if present to avoid
+        # duplicate keyword argument (we pass it explicitly below).
+        worker_kwargs.pop("kubectl_config", None)
+
         worker = OptimizationWorker(
             worker_id=worker_id,
             workdir=workdir,
@@ -893,8 +904,9 @@ class KubectlRooflineAnalyzer(RooflineAnalyzerBase):
 class KubectlBottleneckAnalyzer(BottleneckAnalyzerBase):
     """LLM-based bottleneck analyzer that works without NCU metrics.
 
-    Delegates to the real ``BottleneckAnalyzer`` with empty gpu_specs.
-    The LLM performs code-only analysis when metrics are empty.
+    Delegates to the real ``BottleneckAnalyzer``. When GPU specs are
+    provided (from ``KubectlAcceleratorSpecsProvider``), the LLM gets
+    real hardware info for better analysis even without NCU metrics.
     """
 
     def __init__(
@@ -903,11 +915,13 @@ class KubectlBottleneckAnalyzer(BottleneckAnalyzerBase):
         log_dir: Path | None = None,
         openai_model: str = "claude-opus-4.5",
         kubectl_config: KubectlConfig | None = None,
+        gpu_specs: dict[str, Any] | None = None,
         **kwargs: Any,
     ) -> None:
         self._logger = logger or logging.getLogger(__name__)
         self._log_dir = Path(log_dir) if log_dir else None
         self._openai_model = openai_model
+        self._gpu_specs = gpu_specs
         self._delegate: Any | None = None
         self.roofline = KubectlRooflineAnalyzer()
 
@@ -919,8 +933,7 @@ class KubectlBottleneckAnalyzer(BottleneckAnalyzerBase):
             from utils.providers import get_model_provider
 
             provider = get_model_provider(self._openai_model)
-            # Empty gpu_specs — LLM does code-only analysis
-            gpu_specs: dict[str, Any] = {
+            gpu_specs = self._gpu_specs or {
                 "name": "remote (kubectl)",
                 "architecture": "unknown",
                 "peak_fp32_tflops": 0.0,
@@ -984,7 +997,12 @@ class KubectlAcceleratorSpecsProvider(AcceleratorSpecsProvider):
                     get_gpu_specs,
                 )
 
-                return get_gpu_specs(device_name)
+                specs = get_gpu_specs(device_name)
+                if specs is not None:
+                    return specs
+                self._logger.warning(
+                    f"GPU '{device_name}' not in specs database, using stub"
+                )
             except Exception as e:
                 self._logger.warning(
                     f"GPU specs lookup failed for '{device_name}': {e}"
@@ -1095,8 +1113,10 @@ class KubectlBenchmark:
                         local_result.read_text(encoding="utf-8")
                     )
 
-                kernel_name = kernel_file.stem
-                kernel_results = results.get("kernels", {}).get(kernel_name, {})
+                # We always copy the file as kernel.py to the pod,
+                # so the results are keyed under "kernel" regardless
+                # of the original local filename.
+                kernel_results = results.get("kernels", {}).get("kernel", {})
 
                 return {
                     "time_ms": kernel_results.get("time_ms", float("inf")),
