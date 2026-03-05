@@ -88,6 +88,7 @@ class OptimizationManager:
         high_reasoning_effort: bool = True,
         bottleneck_override: str | None = None,
         platform: dict[str, str] | str | None = None,
+        kubectl_config: Any | None = None,
         **worker_kwargs: Any,
     ):
         """Initialize the optimization manager.
@@ -106,8 +107,12 @@ class OptimizationManager:
                 - ``None`` — use ``"nvidia"`` for all components (default)
                 - a string like ``"nvidia"`` — shorthand for all components
                 - a dict like ``{"verifier": "nvidia", ...}`` — per-component
+            kubectl_config: Optional ``KubectlConfig`` for remote GPU execution.
+                When provided, GPU operations are sent to a Kubernetes pod
+                via ``kubectl exec``/``kubectl cp``.
             **worker_kwargs: Additional kwargs passed to OptimizationWorker
         """
+        self.kubectl_config = kubectl_config
         self.max_rounds = max_rounds
         self.log_dir = (
             Path(log_dir) if log_dir else Path(tempfile.mkdtemp(prefix="opt_"))
@@ -202,6 +207,7 @@ class OptimizationManager:
             high_reasoning_effort=self.high_reasoning_effort,
             bottleneck_override=self.bottleneck_override,
             worker_kwargs=self.worker_kwargs,
+            kubectl_config=self.kubectl_config,
         )
         self.verifier = components["verifier"]
         self.benchmarker = components["benchmarker"]
@@ -212,6 +218,11 @@ class OptimizationManager:
         # registry so there are no pickling issues.
         if worker_config:
             self.worker_kwargs["platform_config"] = worker_config
+
+        # Pass kubectl_config to workers so they can create
+        # KubectlBenchmark / KubectlVerificationWorker instances.
+        if self.kubectl_config is not None:
+            self.worker_kwargs["kubectl_config"] = self.kubectl_config
 
     # ------------------------------------------------------------------
     # Logging / strategy helpers (unchanged)

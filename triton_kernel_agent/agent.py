@@ -43,6 +43,7 @@ class TritonKernelAgent:
         target_platform: PlatformConfig | None = None,
         no_cusolver: bool = False,
         test_timeout_s: int = 30,
+        kubectl_config: Any | None = None,
     ):
         """
         Initialize the Triton Kernel Agent.
@@ -110,6 +111,7 @@ class TritonKernelAgent:
             target_platform=self._platform_config.name,
             no_cusolver=self.no_cusolver,
             test_timeout_s=self.test_timeout_s,
+            kubectl_config=kubectl_config,
         )
 
     def _setup_logging(self):

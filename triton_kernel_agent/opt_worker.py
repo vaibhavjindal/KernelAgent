@@ -96,6 +96,8 @@ class OptimizationWorker:
         platform_components: dict[str, Any] | None = None,
         # Registry-driven platform config (string names) ───────────
         platform_config: dict[str, str] | None = None,
+        # Kubectl remote GPU execution config ──────────────────────
+        kubectl_config: Any | None = None,
     ):
         """
         Initialize the optimization worker.
@@ -147,6 +149,7 @@ class OptimizationWorker:
         # Platform components (registry-resolved, may be empty)
         self._platform = platform_components or {}
         self._platform_config = platform_config or {}
+        self.kubectl_config = kubectl_config
 
         # BeamSearch parameters
         self.bottleneck_id = bottleneck_id
@@ -186,6 +189,14 @@ class OptimizationWorker:
 
         # Get GPU specs (via registry-resolved provider or default NVIDIA lookup)
         specs_provider = self._platform.get("specs_provider")
+        if specs_provider is None and self.kubectl_config is not None:
+            from triton_kernel_agent.platform.kubectl import (
+                KubectlAcceleratorSpecsProvider,
+            )
+
+            specs_provider = KubectlAcceleratorSpecsProvider(
+                kubectl_config=self.kubectl_config, logger=self.logger
+            )
         if specs_provider is not None:
             self.gpu_specs = specs_provider.get_specs(self.gpu_name)
         else:
@@ -241,6 +252,12 @@ class OptimizationWorker:
             openai_model=self.openai_model,
             gpu_name=self.gpu_name,
             roofline_config=self.roofline_config,
+            benchmark_lock=self.benchmark_lock,
+            worker_id=self.worker_id,
+            workdir=self.workdir,
+            high_reasoning_effort=self.high_reasoning_effort,
+            target_platform=self.target_platform,
+            kubectl_config=self.kubectl_config,
         )
         for k, v in resolved.items():
             if k not in self._platform:
@@ -257,22 +274,41 @@ class OptimizationWorker:
         self.prompt_manager = PromptManager(target_platform=platform_config)
 
         # Benchmarking
-        from triton_kernel_agent.opt_worker_component.benchmarking.benchmark import (
-            Benchmark,
-        )
+        if "worker_benchmarker" in self._platform:
+            self.benchmarker = self._platform["worker_benchmarker"]
+        elif self.kubectl_config is not None:
+            from triton_kernel_agent.platform.kubectl import KubectlBenchmark
 
-        self.benchmarker = Benchmark(
-            logger=self.logger,
-            artifacts_dir=self.artifact_dir,
-            benchmark_lock=self.benchmark_lock,
-            worker_id=self.worker_id,
-            warmup=self.benchmark_warmup,
-            repeat=self.benchmark_repeat,
-        )
+            self.benchmarker = KubectlBenchmark(
+                kubectl_config=self.kubectl_config,
+                benchmark_lock=self.benchmark_lock,
+                logger=self.logger,
+                worker_id=self.worker_id,
+                artifacts_dir=self.artifact_dir,
+                warmup=self.benchmark_warmup,
+                repeat=self.benchmark_repeat,
+            )
+        else:
+            from triton_kernel_agent.opt_worker_component.benchmarking.benchmark import (
+                Benchmark,
+            )
+
+            self.benchmarker = Benchmark(
+                logger=self.logger,
+                artifacts_dir=self.artifact_dir,
+                benchmark_lock=self.benchmark_lock,
+                worker_id=self.worker_id,
+                warmup=self.benchmark_warmup,
+                repeat=self.benchmark_repeat,
+            )
 
         # Profiler
         if "profiler" in self._platform:
             self.profiler = self._platform["profiler"]
+        elif self.kubectl_config is not None:
+            from triton_kernel_agent.platform.kubectl import KubectlKernelProfiler
+
+            self.profiler = KubectlKernelProfiler()
         else:
             from triton_kernel_agent.opt_worker_component.profiling.kernel_profiler import (
                 KernelProfiler,
@@ -289,6 +325,16 @@ class OptimizationWorker:
         # Bottleneck analyzer
         if "bottleneck_analyzer" in self._platform:
             self.bottleneck_analyzer = self._platform["bottleneck_analyzer"]
+        elif self.kubectl_config is not None:
+            from triton_kernel_agent.platform.kubectl import KubectlBottleneckAnalyzer
+
+            self.bottleneck_analyzer = KubectlBottleneckAnalyzer(
+                logger=self.logger,
+                log_dir=self.log_dir,
+                openai_model=self.openai_model,
+                kubectl_config=self.kubectl_config,
+                gpu_specs=self.gpu_specs,
+            )
         else:
             from triton_kernel_agent.opt_worker_component.prescribing.bottleneck_analyzer import (
                 BottleneckAnalyzer,
@@ -303,20 +349,39 @@ class OptimizationWorker:
             )
 
         # Verification worker (for correctness checks)
-        from triton_kernel_agent.worker import VerificationWorker
+        if "worker_verifier" in self._platform:
+            self.verification_worker = self._platform["worker_verifier"]
+        elif self.kubectl_config is not None:
+            from triton_kernel_agent.platform.kubectl import KubectlVerificationWorker
 
-        self.verification_worker = VerificationWorker(
-            worker_id=self.worker_id,
-            workdir=self.workdir,
-            log_dir=self.log_dir,
-            openai_model=self.openai_model,
-            high_reasoning_effort=self.high_reasoning_effort,
-            target_platform=self.target_platform,
-        )
+            self.verification_worker = KubectlVerificationWorker(
+                kubectl_config=self.kubectl_config,
+                worker_id=self.worker_id,
+                workdir=self.workdir,
+                log_dir=self.log_dir,
+                openai_model=self.openai_model,
+                high_reasoning_effort=self.high_reasoning_effort,
+                target_platform=self.target_platform,
+            )
+        else:
+            from triton_kernel_agent.worker import VerificationWorker
+
+            self.verification_worker = VerificationWorker(
+                worker_id=self.worker_id,
+                workdir=self.workdir,
+                log_dir=self.log_dir,
+                openai_model=self.openai_model,
+                high_reasoning_effort=self.high_reasoning_effort,
+                target_platform=self.target_platform,
+            )
 
         # Roofline analyzer
         if "roofline_analyzer" in self._platform:
             self.roofline_analyzer = self._platform["roofline_analyzer"]
+        elif self.kubectl_config is not None:
+            from triton_kernel_agent.platform.kubectl import KubectlRooflineAnalyzer
+
+            self.roofline_analyzer = KubectlRooflineAnalyzer()
         else:
             from kernel_perf_agent.kernel_opt.roofline.ncu_roofline import (
                 RooflineAnalyzer,

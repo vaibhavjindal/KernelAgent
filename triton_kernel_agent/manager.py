@@ -40,6 +40,7 @@ class WorkerManager:
         target_platform: str = "cuda",
         no_cusolver: bool = False,
         test_timeout_s: int = 30,
+        kubectl_config: Any = None,
     ):
         """
         Initialize the worker manager.
@@ -65,6 +66,7 @@ class WorkerManager:
         self.target_platform = target_platform
         self.no_cusolver = no_cusolver
         self.test_timeout_s = test_timeout_s
+        self.kubectl_config = kubectl_config
 
         # Setup logging
         if log_dir is None:
@@ -172,6 +174,7 @@ class WorkerManager:
                     self.target_platform,
                     self.no_cusolver,
                     self.test_timeout_s,
+                    self.kubectl_config,
                 )
 
                 process = mp.Process(target=worker_process, args=args)
@@ -238,6 +241,7 @@ def worker_process(
     target_platform: str,
     no_cusolver: bool = False,
     test_timeout_s: int = 30,
+    kubectl_config: Any = None,
 ):
     """
     Worker process for kernel verification and refinement.
@@ -247,19 +251,37 @@ def worker_process(
     # Import here to avoid issues with multiprocessing
     from .worker import VerificationWorker
 
-    worker = VerificationWorker(
-        worker_id=worker_id,
-        workdir=workdir,
-        log_dir=log_dir,
-        max_rounds=max_rounds,
-        history_size=history_size,
-        openai_api_key=openai_api_key,
-        openai_model=openai_model,
-        high_reasoning_effort=high_reasoning_effort,
-        target_platform=target_platform,
-        no_cusolver=no_cusolver,
-        test_timeout_s=test_timeout_s,
-    )
+    if kubectl_config is not None:
+        from triton_kernel_agent.platform.kubectl import KubectlVerificationWorker
+
+        worker = KubectlVerificationWorker(
+            kubectl_config=kubectl_config,
+            worker_id=worker_id,
+            workdir=workdir,
+            log_dir=log_dir,
+            max_rounds=max_rounds,
+            history_size=history_size,
+            openai_api_key=openai_api_key,
+            openai_model=openai_model,
+            high_reasoning_effort=high_reasoning_effort,
+            target_platform=target_platform,
+            no_cusolver=no_cusolver,
+            test_timeout_s=test_timeout_s,
+        )
+    else:
+        worker = VerificationWorker(
+            worker_id=worker_id,
+            workdir=workdir,
+            log_dir=log_dir,
+            max_rounds=max_rounds,
+            history_size=history_size,
+            openai_api_key=openai_api_key,
+            openai_model=openai_model,
+            high_reasoning_effort=high_reasoning_effort,
+            target_platform=target_platform,
+            no_cusolver=no_cusolver,
+            test_timeout_s=test_timeout_s,
+        )
 
     result = worker.run(
         kernel_code=kernel_code,

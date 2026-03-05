@@ -113,6 +113,23 @@ _GPU_SPECS_DATABASE: dict[str, dict[str, object]] = {
         "form_factor": "SXM5",
         "tdp_w": 700,
     },
+    # NVIDIA H100 80GB HBM3 — alternate device name reported by some SXM5 SKUs
+    "NVIDIA H100 80GB HBM3": {
+        "name": "NVIDIA H100 80GB HBM3",
+        "architecture": "Hopper",
+        "peak_fp32_tflops": 67.0,
+        "peak_fp16_tflops": 1979.0,
+        "peak_bf16_tflops": 1979.0,
+        "peak_memory_bw_gbps": 3350,
+        "sm_count": 132,
+        "max_threads_per_sm": 2048,
+        "l1_cache_kb": 256,
+        "l2_cache_mb": 50,
+        "memory_gb": 80,
+        "memory_type": "HBM3",
+        "form_factor": "SXM5",
+        "tdp_w": 700,
+    },
     # NVIDIA H100 SKUs - PCIe Variant
     "NVIDIA H100 PCIe 80GB": {
         "name": "NVIDIA H100 PCIe 80GB",

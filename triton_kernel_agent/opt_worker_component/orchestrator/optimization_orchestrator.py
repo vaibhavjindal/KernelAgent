@@ -732,16 +732,15 @@ class OptimizationOrchestrator:
         )
 
         if profiler_results is None:
-            self.logger.warning(f"[{round_num}] Profiling failed")
-            return None, None, None
-
-        ncu_metrics = profiler_results.metrics
-
-        if not ncu_metrics:
-            return None, None, ncu_metrics
+            self.logger.warning(
+                f"[{round_num}] Profiling unavailable — using code-only analysis"
+            )
+            ncu_metrics = {}
+        else:
+            ncu_metrics = profiler_results.metrics or {}
 
         # Run roofline analysis
-        flat_metrics = next(iter(ncu_metrics.values()), {}) if ncu_metrics else {}
+        flat_metrics = _get_triton_kernel_metrics(ncu_metrics) if ncu_metrics else {}
         roofline_result = self.bottleneck_analyzer.roofline.analyze(flat_metrics)
 
         # Use pre-computed bottleneck if override is set

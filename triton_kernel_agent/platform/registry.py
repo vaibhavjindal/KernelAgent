@@ -251,5 +251,30 @@ def _register_builtins() -> None:
     for component, factory in _noop.items():
         registry.register(component, "noop", factory)
 
+    from triton_kernel_agent.platform.kubectl import (
+        KubectlAcceleratorSpecsProvider,
+        KubectlBenchmarker,
+        KubectlBottleneckAnalyzer,
+        KubectlKernelProfiler,
+        KubectlRooflineAnalyzer,
+        KubectlVerifier,
+        KubectlWorkerRunner,
+    )
+
+    _kubectl = {
+        # Manager-level
+        "verifier": KubectlVerifier,
+        "benchmarker": KubectlBenchmarker,
+        "worker_runner": KubectlWorkerRunner,
+        # Worker-level
+        "specs_provider": KubectlAcceleratorSpecsProvider,
+        "profiler": KubectlKernelProfiler,
+        "roofline_analyzer": KubectlRooflineAnalyzer,
+        "bottleneck_analyzer": KubectlBottleneckAnalyzer,
+        "rag_prescriber": NoOpRAGPrescriber,
+    }
+    for component, factory in _kubectl.items():
+        registry.register(component, "kubectl", factory)
+
 
 _register_builtins()
