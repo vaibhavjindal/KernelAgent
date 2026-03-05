@@ -308,7 +308,13 @@ class OptimizationWorker:
         elif self.kubectl_config is not None:
             from triton_kernel_agent.platform.kubectl import KubectlKernelProfiler
 
-            self.profiler = KubectlKernelProfiler()
+            self.profiler = KubectlKernelProfiler(
+                kubectl_config=self.kubectl_config,
+                logger=self.logger,
+                artifacts_dir=self.artifact_dir,
+                logs_dir=self.log_dir,
+                profiling_semaphore=self.profiling_semaphore,
+            )
         else:
             from triton_kernel_agent.opt_worker_component.profiling.kernel_profiler import (
                 KernelProfiler,
@@ -334,6 +340,7 @@ class OptimizationWorker:
                 openai_model=self.openai_model,
                 kubectl_config=self.kubectl_config,
                 gpu_specs=self.gpu_specs,
+                roofline_config=self.roofline_config,
             )
         else:
             from triton_kernel_agent.opt_worker_component.prescribing.bottleneck_analyzer import (
@@ -381,7 +388,10 @@ class OptimizationWorker:
         elif self.kubectl_config is not None:
             from triton_kernel_agent.platform.kubectl import KubectlRooflineAnalyzer
 
-            self.roofline_analyzer = KubectlRooflineAnalyzer()
+            self.roofline_analyzer = KubectlRooflineAnalyzer(
+                logger=self.logger,
+                roofline_config=self.roofline_config,
+            )
         else:
             from kernel_perf_agent.kernel_opt.roofline.ncu_roofline import (
                 RooflineAnalyzer,

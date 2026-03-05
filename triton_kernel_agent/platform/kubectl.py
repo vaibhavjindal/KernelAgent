@@ -16,11 +16,11 @@
 
 This module enables running the optimization pipeline on a local machine
 without a GPU by offloading GPU operations (kernel verification,
-benchmarking) to a Kubernetes pod via ``kubectl exec`` and ``kubectl cp``.
+benchmarking, NCU profiling) to a Kubernetes pod via ``kubectl exec``
+and ``kubectl cp``.
 
-LLM calls remain local (where internet access is available); only GPU
-work is sent to the pod.  NCU profiling is unavailable, so bottleneck
-analysis is code-only.
+LLM calls and CSV parsing remain local (where internet access and
+pandas are available); only GPU work is sent to the pod.
 
 Usage::
 
@@ -78,6 +78,7 @@ class KubectlConfig:
     label_selector: str = ""
     container: str = ""
     python_path: str = "python3"
+    ncu_bin_path: str = "ncu"
 
     @classmethod
     def from_env(cls) -> "KubectlConfig":
@@ -89,6 +90,7 @@ class KubectlConfig:
             KUBECTL_LABEL_SELECTOR  — label selector for auto-discovery
             KUBECTL_CONTAINER       — container name in pod (optional)
             KUBECTL_PYTHON_PATH     — python binary on pod (default: ``"python3"``)
+            KUBECTL_NCU_BIN_PATH    — NCU binary on pod (default: ``"ncu"``)
         """
         return cls(
             pod_name=os.environ.get("KUBECTL_POD_NAME", ""),
@@ -96,6 +98,7 @@ class KubectlConfig:
             label_selector=os.environ.get("KUBECTL_LABEL_SELECTOR", ""),
             container=os.environ.get("KUBECTL_CONTAINER", ""),
             python_path=os.environ.get("KUBECTL_PYTHON_PATH", "python3"),
+            ncu_bin_path=os.environ.get("KUBECTL_NCU_BIN_PATH", "ncu"),
         )
 
 
@@ -859,10 +862,88 @@ def _kubectl_worker_process(
 
 
 class KubectlKernelProfiler(KernelProfilerBase):
-    """No-op profiler — NCU is not available on the kubectl pod."""
+    """Profiles kernels on a remote GPU pod by running NCU via kubectl exec.
 
-    def __init__(self, **kwargs: Any) -> None:
-        pass
+    Steps:
+    1. Generate an NCU wrapper script with pod-relative paths (all files in
+       the same remote temp directory).
+    2. Copy kernel, problem, and wrapper files to the pod.
+    3. Run NCU via ``kubectl exec``.
+    4. Copy the CSV results back to the local artifacts directory.
+    5. Parse metrics locally using ``load_ncu_metrics`` / ``metrics_to_prompt``
+       (pure pandas — no GPU needed).
+    """
+
+    # Default timeouts
+    NCU_TIMEOUT_SECONDS = 360
+    SEMAPHORE_TIMEOUT_SECONDS = 900
+
+    def __init__(
+        self,
+        kubectl_config: KubectlConfig | None = None,
+        logger: logging.Logger | None = None,
+        artifacts_dir: Path | None = None,
+        logs_dir: Path | None = None,
+        profiling_semaphore: Any | None = None,
+        **kwargs: Any,
+    ) -> None:
+        self._config = kubectl_config or KubectlConfig()
+        self._logger = logger or logging.getLogger(__name__)
+        self._executor = KubectlExecutor(self._config, self._logger)
+        self.artifacts_dir = artifacts_dir or Path(".")
+        self.logs_dir = logs_dir or Path(".")
+        self.profiling_semaphore = profiling_semaphore
+
+        # Lazy-load the Jinja2 template from NCUWrapperFactory
+        from triton_kernel_agent.opt_worker_component.profiling.ncu_wrapper_factory import (
+            NCUWrapperFactory,
+        )
+
+        self._wrapper_factory = NCUWrapperFactory(self._logger)
+
+    def _generate_pod_wrapper(self, output_dir: Path) -> Path:
+        """Generate an NCU wrapper script with pod-relative paths.
+
+        All files (kernel.py, problem.py, ncu_wrapper.py) will be in the
+        same directory on the pod, so we use ``'.'`` as the path prefix.
+        """
+        wrapper_file = output_dir / "ncu_wrapper.py"
+        wrapper_content = self._wrapper_factory.template.render(
+            kernel_file_parent="'.'",
+            problem_file_parent="'.'",
+            kernel_module="kernel",
+            problem_module="problem",
+            dtype_inference=True,
+            model_extraction=True,
+        )
+        wrapper_file.write_text(wrapper_content)
+        self._logger.debug(f"Generated pod NCU wrapper: {wrapper_file}")
+        return wrapper_file
+
+    def _build_ncu_command(self, remote_dir: str) -> str:
+        """Build the NCU command string to execute on the pod."""
+        from kernel_perf_agent.kernel_opt.profiler.ncu_profiler import METRICS
+
+        ncu_bin = self._config.ncu_bin_path
+        python = self._config.python_path
+        csv_path = f"{remote_dir}/ncu_output.csv"
+        wrapper_path = f"{remote_dir}/ncu_wrapper.py"
+
+        return (
+            f"{ncu_bin} --csv --page=raw --kernel-name-base=demangled "
+            f"--target-processes=all --replay-mode=kernel "
+            f"--profile-from-start=on "
+            f"--log-file={csv_path} "
+            f"--metrics={METRICS} "
+            f"--launch-skip=3 --launch-count=20 "
+            f"{python} {wrapper_path}"
+        )
+
+    def _wait_with_backoff(self, attempt: int) -> None:
+        """Wait with exponential backoff before retrying."""
+        wait_time = 2**attempt
+        self._logger.warning(f"Retrying in {wait_time}s...")
+        time.sleep(wait_time)
 
     def profile_kernel(
         self,
@@ -871,42 +952,240 @@ class KubectlKernelProfiler(KernelProfilerBase):
         round_num: int,
         max_retries: int = 2,
     ) -> Any | None:
+        """Profile kernel with NCU on the remote GPU pod.
+
+        Acquires the profiling semaphore (if set) since NCU requires
+        exclusive GPU access.
+
+        Returns:
+            ``ProfilerResults`` or ``None`` on failure.
+        """
+        # Acquire profiling semaphore (NCU needs exclusive GPU access)
+        semaphore_acquired = False
+        if self.profiling_semaphore is not None:
+            self._logger.info(
+                f"[Round {round_num}] Waiting for profiling semaphore..."
+            )
+            semaphore_acquired = self.profiling_semaphore.acquire(
+                timeout=self.SEMAPHORE_TIMEOUT_SECONDS
+            )
+            if not semaphore_acquired:
+                self._logger.warning(
+                    f"[Round {round_num}] Semaphore timeout after "
+                    f"{self.SEMAPHORE_TIMEOUT_SECONDS}s, skipping profiling"
+                )
+                return None
+            self._logger.info(
+                f"[Round {round_num}] Acquired profiling semaphore"
+            )
+
+        try:
+            return self._profile_kernel_impl(
+                kernel_file, problem_file, round_num, max_retries
+            )
+        finally:
+            if semaphore_acquired:
+                self.profiling_semaphore.release()
+                self._logger.debug(
+                    f"[Round {round_num}] Released profiling semaphore"
+                )
+
+    def _profile_kernel_impl(
+        self,
+        kernel_file: Path,
+        problem_file: Path,
+        round_num: int,
+        max_retries: int,
+    ) -> Any | None:
+        """Internal profiling implementation (called with semaphore held)."""
+        from datetime import datetime
+
+        from kernel_perf_agent.kernel_opt.profiler.ncu_profiler import (
+            load_ncu_metrics,
+            metrics_to_prompt,
+        )
+        from triton_kernel_agent.opt_worker_component.profiling.kernel_profiler import (
+            ProfilerMetadata,
+            ProfilerResults,
+        )
+
+        for attempt in range(1, max_retries + 1):
+            remote_dir = ""
+            try:
+                self._logger.info(
+                    f"[Round {round_num}] NCU profiling attempt "
+                    f"{attempt}/{max_retries} (kubectl)..."
+                )
+
+                # 1. Create remote temp dir
+                remote_dir = self._executor.mkdtemp()
+
+                # 2. Generate wrapper and copy files to pod
+                with tempfile.TemporaryDirectory() as local_tmp:
+                    local_tmp_path = Path(local_tmp)
+                    wrapper_file = self._generate_pod_wrapper(local_tmp_path)
+
+                    self._executor.copy_to(
+                        kernel_file, f"{remote_dir}/kernel.py"
+                    )
+                    self._executor.copy_to(
+                        problem_file, f"{remote_dir}/problem.py"
+                    )
+                    self._executor.copy_to(
+                        wrapper_file, f"{remote_dir}/ncu_wrapper.py"
+                    )
+
+                # 3. Run NCU on the pod
+                ncu_cmd = self._build_ncu_command(remote_dir)
+                self._logger.info(
+                    f"[Round {round_num}] Running NCU on pod: "
+                    f"{ncu_cmd[:120]}..."
+                )
+                rc, stdout, stderr = self._executor.exec(
+                    ncu_cmd, timeout=self.NCU_TIMEOUT_SECONDS
+                )
+
+                if rc != 0:
+                    # Filter kubectl warnings from real errors
+                    real_stderr = "\n".join(
+                        line
+                        for line in stderr.splitlines()
+                        if "Defaulted container" not in line
+                    ).strip()
+                    raise RuntimeError(
+                        f"NCU failed (rc={rc}): {real_stderr[:500]}"
+                    )
+
+                # 4. Copy CSV back to local artifacts
+                csv_filename = f"ncu_round_{round_num}.csv"
+                local_csv = self.artifacts_dir / csv_filename
+                self._executor.copy_from(
+                    f"{remote_dir}/ncu_output.csv", local_csv
+                )
+
+                if not local_csv.exists() or local_csv.stat().st_size < 100:
+                    raise RuntimeError(
+                        f"NCU CSV missing or too small: {local_csv}"
+                    )
+
+                # 5. Parse metrics locally (pure pandas, no GPU)
+                metrics_df = load_ncu_metrics(local_csv, select="last")
+                metrics = json.loads(metrics_to_prompt(metrics_df))
+
+                # 6. Build and return ProfilerResults
+                results = ProfilerResults(
+                    metrics_df=metrics_df,
+                    metrics=metrics,
+                    metadata=ProfilerMetadata(
+                        kernel_file=str(kernel_file),
+                        problem_file=str(problem_file),
+                        round_num=round_num,
+                        timestamp=datetime.utcnow().isoformat() + "Z",
+                        ncu_version=None,
+                    ),
+                )
+
+                # Save metrics JSON
+                metrics_file = (
+                    self.logs_dir
+                    / f"round{round_num:03d}_ncu_metrics.json"
+                )
+                with open(metrics_file, "w") as f:
+                    f.write(results.to_json())
+
+                self._logger.info(
+                    f"NCU profiling completed for round {round_num} (kubectl)"
+                )
+                return results
+
+            except subprocess.TimeoutExpired:
+                if attempt >= max_retries:
+                    self._logger.error(
+                        f"NCU profiling timed out after "
+                        f"{self.NCU_TIMEOUT_SECONDS}s "
+                        f"(final attempt {attempt}/{max_retries}, kubectl)"
+                    )
+                    return None
+                self._logger.debug(
+                    f"NCU timed out (attempt {attempt}/{max_retries})"
+                )
+                self._wait_with_backoff(attempt)
+
+            except json.JSONDecodeError as e:
+                if attempt >= max_retries:
+                    self._logger.error(
+                        f"Failed to parse NCU metrics "
+                        f"(final attempt, kubectl): {e}"
+                    )
+                    return None
+                self._logger.debug(
+                    f"NCU metrics parse error "
+                    f"(attempt {attempt}/{max_retries}): {e}"
+                )
+                self._wait_with_backoff(attempt)
+
+            except Exception as e:
+                if attempt >= max_retries:
+                    self._logger.error(
+                        f"NCU profiling error "
+                        f"(final attempt, kubectl): {e}",
+                        exc_info=True,
+                    )
+                    return None
+                self._logger.debug(
+                    f"NCU error (attempt {attempt}/{max_retries}): {e}"
+                )
+                self._wait_with_backoff(attempt)
+
+            finally:
+                if remote_dir:
+                    self._executor.rm(remote_dir)
+
+        self._logger.error(
+            f"NCU profiling failed after {max_retries} attempts "
+            f"for round {round_num} (kubectl)"
+        )
         return None
 
 
 class KubectlRooflineAnalyzer(RooflineAnalyzerBase):
-    """Stub roofline analyzer — no NCU metrics available.
+    """Roofline analyzer for kubectl platform.
 
-    Returns 0% efficiency and never triggers early stopping so
-    optimisation runs for all configured rounds.
+    Delegates to the real ``RooflineAnalyzer`` which is pure computation
+    (no GPU needed) — it just needs NCU metric values as input.
     """
 
-    def analyze(self, ncu_metrics: dict[str, Any]) -> Any:
-        from kernel_perf_agent.kernel_opt.roofline.ncu_roofline import RooflineResult
-
-        return RooflineResult(
-            efficiency_pct=0.0,
-            compute_sol_pct=0.0,
-            memory_sol_pct=0.0,
-            bottleneck="unknown",
-            at_roofline=False,
-            headroom_pct=100.0,
-            uses_tensor_cores=False,
+    def __init__(
+        self,
+        logger: logging.Logger | None = None,
+        roofline_config: Any | None = None,
+        **kwargs: Any,
+    ) -> None:
+        from kernel_perf_agent.kernel_opt.roofline.ncu_roofline import (
+            RooflineAnalyzer,
         )
 
+        self._delegate = RooflineAnalyzer(
+            config=roofline_config, logger=logger
+        )
+
+    def analyze(self, ncu_metrics: dict[str, Any]) -> Any:
+        return self._delegate.analyze(ncu_metrics)
+
     def should_stop(self, result: Any = None) -> tuple[bool, str]:
-        return False, ""
+        return self._delegate.should_stop(result)
 
     def reset_history(self) -> None:
-        pass
+        self._delegate.reset_history()
 
 
 class KubectlBottleneckAnalyzer(BottleneckAnalyzerBase):
-    """LLM-based bottleneck analyzer that works without NCU metrics.
+    """LLM-based bottleneck analyzer that works with or without NCU metrics.
 
     Delegates to the real ``BottleneckAnalyzer``. When GPU specs are
     provided (from ``KubectlAcceleratorSpecsProvider``), the LLM gets
-    real hardware info for better analysis even without NCU metrics.
+    real hardware info for better analysis. When NCU profiling is enabled,
+    real NCU metrics and roofline analysis are available.
     """
 
     def __init__(
@@ -916,6 +1195,7 @@ class KubectlBottleneckAnalyzer(BottleneckAnalyzerBase):
         openai_model: str = "claude-opus-4.5",
         kubectl_config: KubectlConfig | None = None,
         gpu_specs: dict[str, Any] | None = None,
+        roofline_config: Any | None = None,
         **kwargs: Any,
     ) -> None:
         self._logger = logger or logging.getLogger(__name__)
@@ -923,7 +1203,9 @@ class KubectlBottleneckAnalyzer(BottleneckAnalyzerBase):
         self._openai_model = openai_model
         self._gpu_specs = gpu_specs
         self._delegate: Any | None = None
-        self.roofline = KubectlRooflineAnalyzer()
+        self.roofline = KubectlRooflineAnalyzer(
+            logger=self._logger, roofline_config=roofline_config
+        )
 
     def _get_delegate(self) -> Any:
         if self._delegate is None:

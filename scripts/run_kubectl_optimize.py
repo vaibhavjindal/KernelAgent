@@ -104,6 +104,10 @@ def test_kernel():
         _NORM = (torch.nn.BatchNorm1d, torch.nn.BatchNorm2d, torch.nn.BatchNorm3d,
                  torch.nn.LayerNorm, torch.nn.GroupNorm,
                  torch.nn.InstanceNorm1d, torch.nn.InstanceNorm2d, torch.nn.InstanceNorm3d)
+        _POOL = (torch.nn.MaxPool1d, torch.nn.MaxPool2d, torch.nn.MaxPool3d,
+                 torch.nn.AvgPool1d, torch.nn.AvgPool2d, torch.nn.AvgPool3d,
+                 torch.nn.AdaptiveAvgPool1d, torch.nn.AdaptiveAvgPool2d, torch.nn.AdaptiveAvgPool3d,
+                 torch.nn.AdaptiveMaxPool1d, torch.nn.AdaptiveMaxPool2d, torch.nn.AdaptiveMaxPool3d)
         for _, m in model.named_modules():
             if isinstance(m, (*_CONV, torch.nn.Linear)):
                 if hasattr(m, "weight") and m.weight is not None:
@@ -122,17 +126,32 @@ def test_kernel():
             elif isinstance(m, _NORM):
                 if getattr(m, "weight", None) is not None:
                     model_params.setdefault("weight", m.weight)
+                    model_params.setdefault("w", m.weight)
                 if getattr(m, "bias", None) is not None:
                     model_params.setdefault("bias", m.bias)
                 if hasattr(m, "eps"):
                     model_params["eps"] = m.eps
+                if hasattr(m, "num_groups"):
+                    model_params["num_groups"] = m.num_groups
+                if hasattr(m, "normalized_shape"):
+                    model_params["normalized_shape"] = m.normalized_shape
+            elif isinstance(m, _POOL):
+                for attr in ("kernel_size", "stride", "padding", "dilation"):
+                    val = getattr(m, attr, None)
+                    if val is not None:
+                        model_params.setdefault(attr, val)
+
+        # Top-level bias on model itself (fusion kernels like Conv+ReLU+BiasAdd)
+        if hasattr(model, "bias") and isinstance(model.bias, (torch.Tensor, torch.nn.Parameter)):
+            model_params["add_bias"] = model.bias.to(device).to(dtype) if model.bias.is_floating_point() else model.bias.to(device)
+            model_params.setdefault("bias", model_params["add_bias"])
 
         if has_var_positional and all_weights:
             # *args style: pass inputs + weights positionally, config as kwargs
             pos_args = list(inputs) + list(all_weights)
             config_kwargs = {}
             for k, v in model_params.items():
-                if k not in ("weight", "w", "bias", "conv_bias"):
+                if k not in ("weight", "w", "bias", "conv_bias", "add_bias"):
                     if isinstance(v, (tuple, list)) and len(v) >= 1 and all(e == v[0] for e in v):
                         v = v[0]
                     config_kwargs[k] = v
