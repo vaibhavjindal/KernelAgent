@@ -1,0 +1,18 @@
+{
+  "name": "kernel-optimizer",
+  "version": "0.1.0",
+  "description": "Claude Code-native Triton kernel optimization using kubectl GPU pods and AI-powered subagents.",
+  "author": {
+    "name": "crew 5545"
+  },
+  "keywords": [
+    "triton",
+    "kernel",
+    "gpu",
+    "optimization",
+    "kubectl",
+    "h100",
+    "cuda",
+    "pytorch"
+  ]
+}
